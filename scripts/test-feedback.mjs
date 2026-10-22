@@ -1,0 +1,54 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+const origin = process.argv[2] ?? "http://127.0.0.1:5174";
+if (!/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(origin)) throw new Error("Disposable fixture checks run only against localhost.");
+const cookieFrom = response => response.headers.getSetCookie().filter(value => value.startsWith("five-words-collection-v1=")).map(value => value.split(";")[0]).join("; ");
+const landing = await fetch(origin + "/", { redirect: "manual" });
+assert.equal(landing.status, 200); assert.equal(landing.headers.get("location"), null);
+const ownerCookie = cookieFrom(landing); assert.ok(ownerCookie, "The landing page must remember an anonymous collection before loading photos.");
+const collectionHeader = landing.headers.getSetCookie().find(value => value.startsWith("five-words-collection-v1="));
+assert.match(collectionHeader, /HttpOnly/i); assert.match(collectionHeader, /SameSite=Lax/i); assert.match(collectionHeader, /Path=\//i); assert.match(collectionHeader, /Max-Age=31536000/i);
+async function request(path, { signed = true, cookie, method = "GET", json, body } = {}) { const headers = { Origin: origin }; if (signed || cookie) headers.Cookie = [signed ? ownerCookie : "", cookie ?? ""].filter(Boolean).join("; "); if (json !== undefined) headers["Content-Type"] = "application/json"; return fetch(origin + path, { method, headers, body: json !== undefined ? JSON.stringify(json) : body }); }
+async function payload(response) { const data = await response.json(); assert.ok(response.ok, `${response.status}: ${JSON.stringify(data)}`); return data; }
+const created = [];
+try {
+  const otherCollection = await request("/api/photos", { signed: false });
+  const otherCookie = cookieFrom(otherCollection); assert.ok(otherCookie); assert.notEqual(otherCookie, ownerCookie);
+  await payload(otherCollection);
+  assert.equal((await request("/api/collection/link", { signed: false })).status, 401);
+  assert.equal((await request("/api/collection/restore", { signed: false, method: "POST", json: { token: "invalid" } })).status, 400);
+  const offOriginRestore = await fetch(origin + "/api/collection/restore", { method: "POST", headers: { Origin: "https://another.example", "Content-Type": "application/json" }, body: JSON.stringify({ token: "0".repeat(64) }) });
+  assert.equal(offOriginRestore.status, 403);
+  const form = new FormData(); form.set("name", "API test · temporary"); form.set("file", new File([await readFile(new URL("../scripts/fixtures/test-image.png", import.meta.url))], "verification.png", { type: "image/png" }));
+  const upload = await payload(await request("/api/photos", { method: "POST", body: form })); const id = upload.uploadedId; created.push(id); assert.ok(upload.photos.some(photo => photo.id === id));
+  const stableCollection = await request("/api/photos"); assert.equal(stableCollection.headers.getSetCookie().length, 0, "Refreshing an existing collection must not overwrite a newer restored cookie."); await payload(stableCollection);
+  assert.equal((await request(`/api/photos/${id}/image`, { signed: false })).status, 401);
+  assert.ok(!(await payload(await request("/api/photos", { signed: false, cookie: otherCookie }))).photos.some(photo => photo.id === id));
+  assert.equal((await request(`/api/photos/${id}/image`, { signed: false, cookie: otherCookie })).status, 404);
+  assert.equal((await request(`/api/photos/${id}`, { signed: false, cookie: otherCookie, method: "PATCH", json: { action: "share" } })).status, 404);
+  assert.equal((await request(`/api/photos/${id}`, { signed: false, cookie: otherCookie, method: "DELETE" })).status, 404);
+  const privateLink = await payload(await request("/api/collection/link"));
+  assert.match(privateLink.path, /^\/restore#[a-f0-9]{64}$/);
+  const recovery = await request("/api/collection/restore", { signed: false, method: "POST", json: { token: privateLink.path.split("#")[1] } });
+  const recoveredCookie = cookieFrom(recovery); await payload(recovery); assert.equal(recoveredCookie, ownerCookie);
+  assert.ok((await payload(await request("/api/photos", { signed: false, cookie: recoveredCookie }))).photos.some(photo => photo.id === id));
+  assert.equal((await request(`/api/photos/${id}/image`, { signed: false, cookie: recoveredCookie })).status, 200);
+  assert.equal((await request(`/api/photos/${id}`, { method: "PATCH", json: null })).status, 400);
+  const shared = await payload(await request(`/api/photos/${id}`, { method: "PATCH", json: { action: "share" } })); const token = shared.photos.find(photo => photo.id === id).shareToken; assert.match(token, /^[a-f0-9]{64}$/);
+  const guest = await request(`/api/feedback/${token}`, { signed: false }); const respondentCookie = guest.headers.getSetCookie().map(value => value.split(";")[0]).join("; "); const view = await payload(guest);
+  assert.deepEqual(Object.keys(view).sort(), ["imageUrl", "ownResponse"]); assert.equal(view.ownResponse, null); assert.equal((await request(view.imageUrl, { signed: false })).status, 200);
+  const words = ["stern", "playful", "guarded", "clever", "warm"];
+  assert.equal((await request(`/api/feedback/${token}`, { signed: false, method: "POST", json: { words } })).status, 400);
+  for (const invalid of [words.slice(0, 4), [...words, "goofy"], ["very stern", ...words.slice(1)], ["STERN", "stern", ...words.slice(2)], ["", ...words.slice(1)]]) assert.equal((await request(`/api/feedback/${token}`, { signed: false, cookie: respondentCookie, method: "POST", json: { words: invalid } })).status, 400);
+  await payload(await request(`/api/feedback/${token}`, { signed: false, cookie: respondentCookie, method: "POST", json: { words } }));
+  const edited = ["stern", "goofy", "guarded", "clever", "self-assured"];
+  await payload(await request(`/api/feedback/${token}`, { signed: false, cookie: respondentCookie, method: "POST", json: { words: edited } }));
+  const list = await payload(await request("/api/photos")); const photo = list.photos.find(photo => photo.id === id); assert.equal(photo.responses.length, 1); assert.deepEqual(photo.responses[0].words, edited);
+  assert.equal((await payload(await request(`/api/feedback/${token}`, { signed: false }))).ownResponse, null);
+  assert.deepEqual((await payload(await request(`/api/feedback/${token}`, { signed: false, cookie: respondentCookie }))).ownResponse, edited);
+  await payload(await request(`/api/photos/${id}`, { method: "PATCH", json: { action: "close" } }));
+  assert.equal((await request(`/api/feedback/${token}`, { signed: false })).status, 404); assert.equal((await request(view.imageUrl, { signed: false })).status, 404); assert.equal((await request(`/api/feedback/${token}`, { signed: false, cookie: respondentCookie, method: "POST", json: { words } })).status, 404);
+  const reopened = await payload(await request(`/api/photos/${id}`, { method: "PATCH", json: { action: "share" } })); const restored = reopened.photos.find(photo => photo.id === id); assert.notEqual(restored.shareToken, token); assert.equal(restored.responses.length, 1);
+  const fake = new FormData(); fake.set("name", "invalid"); fake.set("file", new File([new Uint8Array([137,80,78,71,13,10,26,10,0,0,0,0])], "broken.png", { type: "image/png" })); assert.equal((await request("/api/photos", { method: "POST", body: fake })).status, 400);
+  console.log("Account-free upload, collection isolation and recovery, exactly-five-word validation, response privacy, repeat-response edits, and link revocation checks passed.");
+} finally { for (const id of created) { const result = await request(`/api/photos/${id}`, { method: "DELETE" }); assert.ok(result.ok, "Fixture cleanup failed"); } }
